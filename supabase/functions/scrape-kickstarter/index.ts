@@ -1,4 +1,3 @@
-// Define CORS headers directly in the file instead of importing
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -30,7 +29,6 @@ interface KickstarterReward {
 }
 
 Deno.serve(async (req) => {
-  // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
@@ -51,24 +49,12 @@ Deno.serve(async (req) => {
 
     console.log('Scraping Kickstarter URL:', url);
 
-    // Fetch the Kickstarter page with better headers and error handling
     const response = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9,ja;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
         'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'sec-ch-ua': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
       },
     });
 
@@ -77,461 +63,29 @@ Deno.serve(async (req) => {
     }
 
     const html = await response.text();
-    
-    // Extract data using improved regex patterns and JSON-LD structured data
-    const extractData = (html: string): KickstarterData => {
-      // Helper functions
-      const extractBetween = (text: string, start: string, end: string): string => {
-        const startIndex = text.indexOf(start);
-        if (startIndex === -1) return '';
-        const endIndex = text.indexOf(end, startIndex + start.length);
-        if (endIndex === -1) return '';
-        return text.substring(startIndex + start.length, endIndex).trim();
-      };
-
-      const cleanHtml = (text: string): string => {
-        if (!text) return '';
-        return text
-          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-          .replace(/<[^>]*>/g, '')
-          .replace(/&nbsp;/g, ' ')
-          .replace(/&amp;/g, '&')
-          .replace(/&lt;/g, '<')
-          .replace(/&gt;/g, '>')
-          .replace(/&quot;/g, '"')
-          .replace(/&#39;/g, "'")
-          .replace(/\s+/g, ' ')
-          .trim();
-      };
-
-      const extractNumber = (text: string): number => {
-        if (!text) return 0;
-        const cleanText = text.replace(/[,$\s]/g, '');
-        const match = cleanText.match(/(\d+(?:\.\d+)?)/);
-        return match ? parseFloat(match[1]) : 0;
-      };
-
-      const extractCurrency = (text: string): number => {
-        if (!text) return 0;
-        // Handle different currency formats
-        const match = text.match(/[\$¥€£]?([\d,]+(?:\.\d{2})?)/);
-        if (match) {
-          return parseFloat(match[1].replace(/,/g, ''));
-        }
-        return 0;
-      };
-
-      // Try to extract JSON-LD structured data first
-      let structuredData: any = null;
-      const jsonLdMatch = html.match(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/i);
-      if (jsonLdMatch) {
-        try {
-          structuredData = JSON.parse(jsonLdMatch[1]);
-        } catch (e) {
-          console.log('Failed to parse JSON-LD:', e);
-        }
-      }
-
-      // Extract title with multiple fallbacks
-      let title = '';
-      if (structuredData?.name) {
-        title = structuredData.name;
-      } else {
-        const titlePatterns = [
-          /<h1[^>]*class="[^"]*type-24[^"]*"[^>]*>([^<]+)</i,
-          /<h1[^>]*data-test-id="project-name"[^>]*>([^<]+)</i,
-          /<title[^>]*>([^<]+)</i,
-          /<h1[^>]*>([^<]+)</i,
-        ];
-        
-        for (const pattern of titlePatterns) {
-          const match = html.match(pattern);
-          if (match) {
-            title = cleanHtml(match[1]).replace(' — Kickstarter', '').replace(' by ', ' by ');
-            break;
-          }
-        }
-      }
-
-      // Extract subtitle/description
-      let subtitle = '';
-      if (structuredData?.description) {
-        subtitle = structuredData.description;
-      } else {
-        const subtitlePatterns = [
-          /<meta[^>]*name="description"[^>]*content="([^"]+)"/i,
-          /<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i,
-          /<p[^>]*class="[^"]*type-16[^"]*"[^>]*>([^<]+)</i,
-        ];
-        
-        for (const pattern of subtitlePatterns) {
-          const match = html.match(pattern);
-          if (match) {
-            subtitle = cleanHtml(match[1]);
-            break;
-          }
-        }
-      }
-
-      // Extract image URL
-      let imageUrl = '';
-      if (structuredData?.image) {
-        imageUrl = Array.isArray(structuredData.image) ? structuredData.image[0] : structuredData.image;
-      } else {
-        const imagePatterns = [
-          /<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i,
-          /<meta[^>]*name="twitter:image"[^>]*content="([^"]+)"/i,
-          /<img[^>]*class="[^"]*project-image[^"]*"[^>]*src="([^"]+)"/i,
-        ];
-        
-        for (const pattern of imagePatterns) {
-          const match = html.match(pattern);
-          if (match) {
-            imageUrl = match[1];
-            break;
-          }
-        }
-      }
-
-      // Extract funding data with improved patterns
-      let targetAmount = 0;
-      let currentAmount = 0;
-      let backersCount = 0;
-
-      // Look for data attributes first (most reliable)
-      const goalMatch = html.match(/data-goal="([^"]+)"/i);
-      if (goalMatch) {
-        targetAmount = extractCurrency(goalMatch[1]);
-      }
-
-      const pledgedMatch = html.match(/data-pledged="([^"]+)"/i);
-      if (pledgedMatch) {
-        currentAmount = extractCurrency(pledgedMatch[1]);
-      }
-
-      const backersMatch = html.match(/data-backers-count="([^"]+)"/i);
-      if (backersMatch) {
-        backersCount = extractNumber(backersMatch[1]);
-      }
-
-      // Fallback to text-based extraction
-      if (targetAmount === 0) {
-        const goalPatterns = [
-          /goal[^>]*>[\s\S]*?[\$¥€£]([\d,]+)/i,
-          /target[^>]*>[\s\S]*?[\$¥€£]([\d,]+)/i,
-          /[\$¥€£]([\d,]+)[^>]*goal/i,
-        ];
-        
-        for (const pattern of goalPatterns) {
-          const match = html.match(pattern);
-          if (match) {
-            targetAmount = extractCurrency(match[1]);
-            break;
-          }
-        }
-      }
-
-      if (currentAmount === 0) {
-        const pledgedPatterns = [
-          /pledged[^>]*>[\s\S]*?[\$¥€£]([\d,]+)/i,
-          /raised[^>]*>[\s\S]*?[\$¥€£]([\d,]+)/i,
-          /[\$¥€£]([\d,]+)[^>]*pledged/i,
-        ];
-        
-        for (const pattern of pledgedPatterns) {
-          const match = html.match(pattern);
-          if (match) {
-            currentAmount = extractCurrency(match[1]);
-            break;
-          }
-        }
-      }
-
-      if (backersCount === 0) {
-        const backersPatterns = [
-          /(\d+)[^>]*backers?/i,
-          /backers?[^>]*>[\s\S]*?(\d+)/i,
-          /(\d+)[^>]*supporters?/i,
-        ];
-        
-        for (const pattern of backersPatterns) {
-          const match = html.match(pattern);
-          if (match) {
-            backersCount = extractNumber(match[1]);
-            break;
-          }
-        }
-      }
-
-      // Extract category
-      let category = '';
-      const categoryPatterns = [
-        /<a[^>]*href="[^"]*\/discover\/categories\/([^"\/\?]+)/i,
-        /<span[^>]*class="[^"]*category[^"]*"[^>]*>([^<]+)</i,
-        /category[^>]*>([^<]+)</i,
-      ];
-      
-      for (const pattern of categoryPatterns) {
-        const match = html.match(pattern);
-        if (match) {
-          category = match[1].replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-          break;
-        }
-      }
-
-      // Extract video URL
-      let videoUrl = '';
-      const videoPatterns = [
-        /<meta[^>]*property="og:video"[^>]*content="([^"]+)"/i,
-        /<iframe[^>]*src="([^"]*(?:youtube|vimeo)[^"]+)"/i,
-        /data-video-url="([^"]+)"/i,
-      ];
-      
-      for (const pattern of videoPatterns) {
-        const match = html.match(pattern);
-        if (match) {
-          videoUrl = match[1];
-          break;
-        }
-      }
-
-      // Extract description from project content
-      let description = '';
-      const descriptionPatterns = [
-        /<div[^>]*class="[^"]*full-description[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-        /<div[^>]*class="[^"]*project-content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-        /<section[^>]*class="[^"]*project-description[^"]*"[^>]*>([\s\S]*?)<\/section>/i,
-      ];
-      
-      for (const pattern of descriptionPatterns) {
-        const match = html.match(pattern);
-        if (match) {
-          description = cleanHtml(match[1]).substring(0, 1000);
-          if (description.length === 1000) description += '...';
-          break;
-        }
-      }
-
-      // Extract creator description
-      let creatorDescription = '';
-      const creatorPatterns = [
-        /<div[^>]*class="[^"]*creator-bio[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-        /<section[^>]*class="[^"]*creator[^"]*"[^>]*>([\s\S]*?)<\/section>/i,
-        /<div[^>]*class="[^"]*about-creator[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
-      ];
-      
-      for (const pattern of creatorPatterns) {
-        const match = html.match(pattern);
-        if (match) {
-          creatorDescription = cleanHtml(match[1]).substring(0, 500);
-          if (creatorDescription.length === 500) creatorDescription += '...';
-          break;
-        }
-      }
-
-      // Extract rewards information
-      const extractRewards = (html: string): KickstarterReward[] => {
-        const rewards: KickstarterReward[] = [];
-        
-        // Look for reward sections in the HTML
-        const rewardSectionPatterns = [
-          /<div[^>]*class="[^"]*reward[^"]*"[^>]*>([\s\S]*?)<\/div>/gi,
-          /<section[^>]*class="[^"]*pledge[^"]*"[^>]*>([\s\S]*?)<\/section>/gi,
-          /<div[^>]*data-reward-id[^>]*>([\s\S]*?)<\/div>/gi,
-        ];
-        
-        for (const pattern of rewardSectionPatterns) {
-          const matches = html.matchAll(pattern);
-          for (const match of matches) {
-            const rewardHtml = match[1];
-            
-            // Extract reward title
-            let title = '';
-            const titlePatterns = [
-              /<h3[^>]*>(.*?)<\/h3>/i,
-              /<h4[^>]*>(.*?)<\/h4>/i,
-              /<div[^>]*class="[^"]*title[^"]*"[^>]*>(.*?)<\/div>/i,
-            ];
-            
-            for (const titlePattern of titlePatterns) {
-              const titleMatch = rewardHtml.match(titlePattern);
-              if (titleMatch) {
-                title = cleanHtml(titleMatch[1]);
-                break;
-              }
-            }
-            
-            // Extract reward price
-            let price = 0;
-            const pricePatterns = [
-              /[\$¥€£]\s*(\d+(?:,\d{3})*(?:\.\d{2})?)/i,
-              /(\d+(?:,\d{3})*(?:\.\d{2})?)\s*[\$¥€£]/i,
-              /pledge\s*[\$¥€£]\s*(\d+(?:,\d{3})*(?:\.\d{2})?)/i,
-            ];
-            
-            for (const pricePattern of pricePatterns) {
-              const priceMatch = rewardHtml.match(pricePattern);
-              if (priceMatch) {
-                price = extractCurrency(priceMatch[1]);
-                break;
-              }
-            }
-            
-            // Extract reward description
-            let description = '';
-            const descPatterns = [
-              /<p[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)<\/p>/i,
-              /<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)<\/div>/i,
-              /<p[^>]*>(.*?)<\/p>/i,
-            ];
-            
-            for (const descPattern of descPatterns) {
-              const descMatch = rewardHtml.match(descPattern);
-              if (descMatch) {
-                description = cleanHtml(descMatch[1]).substring(0, 300);
-                if (description.length === 300) description += '...';
-                break;
-              }
-            }
-            
-            // Extract estimated delivery
-            let estimatedDelivery = '';
-            const deliveryPatterns = [
-              /delivery[^>]*(\d{4}年\d{1,2}月)/i,
-              /estimated[^>]*(\d{4}年\d{1,2}月)/i,
-              /(\d{4}年\d{1,2}月)[^>]*delivery/i,
-              /delivery[^>]*(\w+\s+\d{4})/i,
-              /estimated[^>]*(\w+\s+\d{4})/i,
-            ];
-            
-            for (const deliveryPattern of deliveryPatterns) {
-              const deliveryMatch = rewardHtml.match(deliveryPattern);
-              if (deliveryMatch) {
-                estimatedDelivery = deliveryMatch[1];
-                break;
-              }
-            }
-            
-            // Extract backers count for this reward
-            let backersCount = 0;
-            const backersPatterns = [
-              /(\d+)\s*backers?/i,
-              /(\d+)\s*supporters?/i,
-              /(\d+)\s*pledged/i,
-            ];
-            
-            for (const backersPattern of backersPatterns) {
-              const backersMatch = rewardHtml.match(backersPattern);
-              if (backersMatch) {
-                backersCount = extractNumber(backersMatch[1]);
-                break;
-              }
-            }
-            
-            // Extract reward image
-            let imageUrl = '';
-            const imagePatterns = [
-              /<img[^>]*src="([^"]+)"/i,
-              /<div[^>]*style="[^"]*background-image:\s*url\(([^)]+)\)"/i,
-            ];
-            
-            for (const imagePattern of imagePatterns) {
-              const imageMatch = rewardHtml.match(imagePattern);
-              if (imageMatch) {
-                imageUrl = imageMatch[1].replace(/['"]/g, '');
-                break;
-              }
-            }
-            
-            // Extract quantity available
-            let quantityAvailable: number | undefined;
-            const quantityPatterns = [
-              /(\d+)\s*left/i,
-              /(\d+)\s*remaining/i,
-              /limited\s*(\d+)/i,
-            ];
-            
-            for (const quantityPattern of quantityPatterns) {
-              const quantityMatch = rewardHtml.match(quantityPattern);
-              if (quantityMatch) {
-                quantityAvailable = extractNumber(quantityMatch[1]);
-                break;
-              }
-            }
-            
-            // Only add reward if it has essential information
-            if (title && price > 0) {
-              rewards.push({
-                title,
-                description,
-                price,
-                estimatedDelivery: estimatedDelivery || `${new Date().getFullYear() + 1}年${new Date().getMonth() + 1}月`,
-                imageUrl: imageUrl || undefined,
-                quantityAvailable,
-                backersCount,
-              });
-            }
-          }
-        }
-        
-        return rewards;
-      };
-      
-      const rewards = extractRewards(html);
-      // Validate and set defaults
-      return {
-        title: title || 'Untitled Project',
-        subtitle: subtitle || '',
-        imageUrl: imageUrl || '',
-        targetAmount: targetAmount || 0,
-        currentAmount: currentAmount || 0,
-        backersCount: backersCount || 0,
-        category: category || 'Technology',
-        description: description || '',
-        creatorDescription: creatorDescription || '',
-        videoUrl: videoUrl || undefined,
-        rewards: rewards.length > 0 ? rewards : undefined,
-      };
-    };
-
-    const scrapedData = extractData(html);
-
-    // Validate extracted data
-    if (!scrapedData.title || scrapedData.title === 'Untitled Project') {
-      console.warn('Could not extract project title properly');
-    }
-
-    if (scrapedData.targetAmount === 0) {
-      console.warn('Could not extract target amount');
-    }
+    const data = extractData(html);
 
     console.log('Successfully scraped data:', {
-      title: scrapedData.title,
-      targetAmount: scrapedData.targetAmount,
-      currentAmount: scrapedData.currentAmount,
-      backersCount: scrapedData.backersCount,
-      category: scrapedData.category,
-      hasImage: !!scrapedData.imageUrl,
-      hasVideo: !!scrapedData.videoUrl,
-      descriptionLength: scrapedData.description.length,
-      creatorDescriptionLength: scrapedData.creatorDescription.length,
+      title: data.title,
+      targetAmount: data.targetAmount,
+      currentAmount: data.currentAmount,
+      backersCount: data.backersCount,
+      category: data.category,
     });
 
     return new Response(
-      JSON.stringify({ success: true, data: scrapedData }),
+      JSON.stringify({ success: true, data }),
       {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         status: 200,
       }
     );
-
   } catch (error) {
     console.error('Scraping error:', error);
     return new Response(
-      JSON.stringify({ 
+      JSON.stringify({
         error: error.message,
-        details: 'Failed to scrape Kickstarter data. Please check the URL and try again.'
+        details: 'Failed to scrape Kickstarter data. Please check the URL and try again.',
       }),
       {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -540,3 +94,252 @@ Deno.serve(async (req) => {
     );
   }
 });
+
+function extractData(html: string): KickstarterData {
+  // Strategy 1: Extract from embedded JSON data (most reliable)
+  const jsonData = extractEmbeddedJson(html);
+  if (jsonData) {
+    console.log('Extracted data from embedded JSON');
+    return jsonData;
+  }
+
+  // Strategy 2: Extract from meta tags + data attributes
+  console.log('Falling back to meta tags + HTML extraction');
+  return extractFromHtml(html);
+}
+
+/**
+ * KickstarterはページにプロジェクトデータをJSON形式で埋め込んでいる。
+ * window.current_project, data-initial, __NEXT_DATA__ などから取得。
+ */
+function extractEmbeddedJson(html: string): KickstarterData | null {
+  // Pattern 1: window.current_project = {...}
+  const currentProjectMatch = html.match(/window\.current_project\s*=\s*"([^"]+)"/);
+  if (currentProjectMatch) {
+    try {
+      const decoded = currentProjectMatch[1]
+        .replace(/\\&quot;/g, '"')
+        .replace(/&quot;/g, '"')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>');
+      const project = JSON.parse(decoded);
+      return mapProjectJson(project);
+    } catch (e) {
+      console.log('Failed to parse window.current_project:', e);
+    }
+  }
+
+  // Pattern 2: data-initial attribute containing project JSON
+  const dataInitialMatch = html.match(/data-initial="([^"]+)"/);
+  if (dataInitialMatch) {
+    try {
+      const decoded = dataInitialMatch[1]
+        .replace(/&quot;/g, '"')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>');
+      const data = JSON.parse(decoded);
+      const project = data.project || data;
+      if (project.goal || project.pledged) {
+        return mapProjectJson(project);
+      }
+    } catch (e) {
+      console.log('Failed to parse data-initial:', e);
+    }
+  }
+
+  // Pattern 3: React/Next.js style embedded JSON
+  const scriptMatches = html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi);
+  for (const match of scriptMatches) {
+    const content = match[1];
+
+    // Look for project data object with goal/pledged/backers_count
+    if (content.includes('pledged') && content.includes('goal') && content.includes('backers_count')) {
+      // Try to find a JSON object containing project data
+      const jsonPatterns = [
+        /\{[^{}]*"goal"\s*:\s*\d[\s\S]*?"pledged"\s*:\s*\d[\s\S]*?"backers_count"\s*:\s*\d[^{}]*\}/,
+        /\{[\s\S]*?"project"\s*:\s*\{[\s\S]*?"goal"\s*:[\s\S]*?\}\}/,
+      ];
+
+      for (const pattern of jsonPatterns) {
+        const jsonMatch = content.match(pattern);
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            const project = parsed.project || parsed;
+            if (project.goal && project.pledged !== undefined) {
+              return mapProjectJson(project);
+            }
+          } catch {
+            // Continue to next pattern
+          }
+        }
+      }
+    }
+  }
+
+  // Pattern 4: Look for JSON-LD with funding data
+  const jsonLdMatches = html.matchAll(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi);
+  for (const match of jsonLdMatches) {
+    try {
+      const ld = JSON.parse(match[1]);
+      if (ld['@type'] === 'CreativeWork' || ld['@type'] === 'Product' || ld.name) {
+        // JSON-LD doesn't usually have funding data, but might have basic info
+        // We'll use it as supplementary data later if needed
+      }
+    } catch {
+      // Skip invalid JSON-LD
+    }
+  }
+
+  return null;
+}
+
+/**
+ * KickstarterのプロジェクトJSONをKickstarterDataにマッピング
+ */
+function mapProjectJson(project: any): KickstarterData {
+  const goal = typeof project.goal === 'object' ? project.goal.amount : project.goal;
+  const pledged = typeof project.pledged === 'object' ? project.pledged.amount : project.pledged;
+
+  return {
+    title: project.name || project.title || '',
+    subtitle: project.blurb || project.subtitle || '',
+    imageUrl: project.photo?.full || project.photo?.med || project.image_url || '',
+    targetAmount: parseFloat(goal) || 0,
+    currentAmount: parseFloat(pledged) || 0,
+    backersCount: parseInt(project.backers_count) || 0,
+    category: project.category?.name || project.category?.slug || '',
+    description: project.description || '',
+    creatorDescription: project.creator?.blurb || project.creator?.biography || '',
+    videoUrl: project.video?.high || project.video?.base || undefined,
+    rewards: mapRewards(project.rewards),
+  };
+}
+
+function mapRewards(rewards: any[] | undefined): KickstarterReward[] | undefined {
+  if (!rewards || !Array.isArray(rewards) || rewards.length === 0) return undefined;
+
+  return rewards
+    .filter((r: any) => r.minimum || r.pledge_amount)
+    .map((r: any) => ({
+      title: r.title || r.reward || '',
+      description: r.description || '',
+      price: parseFloat(r.minimum || r.pledge_amount) || 0,
+      estimatedDelivery: r.estimated_delivery || '',
+      backersCount: parseInt(r.backers_count) || 0,
+      quantityAvailable: r.limit ? parseInt(r.limit) - (parseInt(r.backers_count) || 0) : undefined,
+    }));
+}
+
+/**
+ * HTMLメタタグ・data属性からの抽出（フォールバック）
+ */
+function extractFromHtml(html: string): KickstarterData {
+  const cleanText = (text: string): string => {
+    if (!text) return '';
+    return text
+      .replace(/<[^>]*>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  const parseCurrency = (text: string): number => {
+    if (!text) return 0;
+    const match = text.replace(/,/g, '').match(/([\d.]+)/);
+    return match ? parseFloat(match[1]) : 0;
+  };
+
+  // Title
+  let title = '';
+  const titlePatterns = [
+    /<meta[^>]*property="og:title"[^>]*content="([^"]+)"/i,
+    /<title[^>]*>([^<]+)<\/title>/i,
+  ];
+  for (const p of titlePatterns) {
+    const m = html.match(p);
+    if (m) {
+      title = cleanText(m[1]).replace(/\s*[—–-]\s*Kickstarter$/, '');
+      break;
+    }
+  }
+
+  // Subtitle
+  let subtitle = '';
+  const subtitlePatterns = [
+    /<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i,
+    /<meta[^>]*name="description"[^>]*content="([^"]+)"/i,
+  ];
+  for (const p of subtitlePatterns) {
+    const m = html.match(p);
+    if (m) { subtitle = cleanText(m[1]); break; }
+  }
+
+  // Image
+  let imageUrl = '';
+  const imgMatch = html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
+  if (imgMatch) imageUrl = imgMatch[1];
+
+  // Funding data from data attributes
+  let targetAmount = 0;
+  let currentAmount = 0;
+  let backersCount = 0;
+
+  const goalMatch = html.match(/data-goal="([^"]+)"/i);
+  if (goalMatch) targetAmount = parseCurrency(goalMatch[1]);
+
+  const pledgedMatch = html.match(/data-pledged="([^"]+)"/i);
+  if (pledgedMatch) currentAmount = parseCurrency(pledgedMatch[1]);
+
+  const backersMatch = html.match(/data-backers-count="([^"]+)"/i);
+  if (backersMatch) backersCount = parseInt(backersMatch[1]) || 0;
+
+  // Funding data from specific HTML structure (more targeted than before)
+  if (targetAmount === 0) {
+    // Look for goal in specific context: "pledged of $X goal"
+    const goalCtxMatch = html.match(/pledged\s+of\s+[\$¥€£]?([\d,]+(?:\.\d+)?)\s*(?:goal|目標)/i);
+    if (goalCtxMatch) targetAmount = parseCurrency(goalCtxMatch[1]);
+  }
+
+  if (currentAmount === 0) {
+    // Look for pledged amount: "$X pledged"
+    const pledgedCtxMatch = html.match(/[\$¥€£]([\d,]+(?:\.\d+)?)\s*(?:pledged|調達済)/i);
+    if (pledgedCtxMatch) currentAmount = parseCurrency(pledgedCtxMatch[1]);
+  }
+
+  if (backersCount === 0) {
+    // Look for backers count: "X backers" in specific context
+    const backersCtxMatch = html.match(/([\d,]+)\s*(?:backers|supporters|バッカー)/i);
+    if (backersCtxMatch) backersCount = parseInt(backersCtxMatch[1].replace(/,/g, '')) || 0;
+  }
+
+  // Video
+  let videoUrl = '';
+  const videoMatch = html.match(/<meta[^>]*property="og:video"[^>]*content="([^"]+)"/i);
+  if (videoMatch) videoUrl = videoMatch[1];
+
+  // Category
+  let category = '';
+  const catMatch = html.match(/<a[^>]*href="\/discover\/categories\/([^"/?]+)/i);
+  if (catMatch) category = catMatch[1].replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+
+  return {
+    title: title || 'Untitled Project',
+    subtitle,
+    imageUrl,
+    targetAmount,
+    currentAmount,
+    backersCount,
+    category: category || '',
+    description: '',
+    creatorDescription: '',
+    videoUrl: videoUrl || undefined,
+  };
+}
