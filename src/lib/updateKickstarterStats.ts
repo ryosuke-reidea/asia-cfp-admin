@@ -7,37 +7,43 @@ export interface KickstarterStats {
 }
 
 export async function updateKickstarterStats(
-  projectId: string, 
+  projectId: string,
   kickstarterUrl: string
 ): Promise<{ success: boolean; data?: KickstarterStats; error?: string }> {
   try {
-    // Vercel APIを使用してKickstarterの最新データを取得
-    const response = await fetch(`https://your-vercel-project.vercel.app/api/getKickstarterStats?url=${encodeURIComponent(kickstarterUrl)}`);
-    
+    // Supabase Edge Function (scrape-kickstarter) を使用してKickstarterの最新データを取得
+    const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/scrape-kickstarter`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({ url: kickstarterUrl }),
+    });
+
     if (!response.ok) {
-      throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      const errorData = await response.json().catch(() => ({ error: 'Network error occurred' }));
+      throw new Error(errorData.error || `API request failed: ${response.status} ${response.statusText}`);
     }
 
     const result = await response.json();
-    
+
     if (!result.success || !result.data) {
       throw new Error(result.error || 'Failed to fetch Kickstarter stats');
     }
 
     const stats: KickstarterStats = {
-      targetAmount: result.data.goal || result.data.targetAmount || 0,
-      currentAmount: result.data.pledged || result.data.currentAmount || 0,
-      backersCount: result.data.backers_count || result.data.backersCount || 0,
-      startDate: result.data.start_date || result.data.startDate,
-      endDate: result.data.end_date || result.data.endDate,
+      targetAmount: result.data.targetAmount || 0,
+      currentAmount: result.data.currentAmount || 0,
+      backersCount: result.data.backersCount || 0,
     };
 
     return { success: true, data: stats };
   } catch (error) {
     console.error('Error updating Kickstarter stats:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error occurred' 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error occurred'
     };
   }
 }
