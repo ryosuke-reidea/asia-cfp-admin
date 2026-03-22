@@ -28,6 +28,16 @@ interface KickstarterReward {
   backersCount: number;
 }
 
+interface StatsData {
+  project: {
+    id: number;
+    state: string;
+    backers_count: number;
+    pledged: string;
+    comments_count: number;
+  };
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -41,45 +51,73 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const { url } = await req.json();
+    const { url, mode } = await req.json();
 
     if (!url || !url.includes('kickstarter.com')) {
       throw new Error('Valid Kickstarter URL is required');
     }
 
-    console.log('Scraping Kickstarter URL:', url);
+    console.log('Fetching Kickstarter data:', url, 'mode:', mode || 'auto');
 
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      },
-    });
+    // Strategy 1: stats.json（Cloudflare回避可能、stats更新に最適）
+    const statsData = await fetchStats(url);
+    if (statsData) {
+      console.log('Successfully fetched stats.json:', statsData);
 
-    if (!response.ok) {
-      throw new Error(`Failed to fetch Kickstarter page: ${response.status} ${response.statusText}`);
+      // stats-onlyモード or フルスクレイプ不要の場合はここで返す
+      const data: KickstarterData = {
+        title: '',
+        subtitle: '',
+        imageUrl: '',
+        targetAmount: 0,
+        currentAmount: parseFloat(statsData.project.pledged) || 0,
+        backersCount: statsData.project.backers_count || 0,
+        category: '',
+        description: '',
+        creatorDescription: '',
+      };
+
+      // mode=stats の場合、またはフルスクレイプが不要な場合
+      if (mode === 'stats') {
+        return new Response(
+          JSON.stringify({ success: true, data, source: 'stats.json' }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
+        );
+      }
+
+      // フルスクレイプも試みる（初回登録時など）
+      try {
+        const fullData = await fetchFullPage(url);
+        if (fullData) {
+          // stats.jsonの最新データで上書き
+          fullData.currentAmount = data.currentAmount;
+          fullData.backersCount = data.backersCount;
+          return new Response(
+            JSON.stringify({ success: true, data: fullData, source: 'full+stats' }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
+          );
+        }
+      } catch (e) {
+        console.log('Full page scrape failed, returning stats only:', e);
+      }
+
+      // フルスクレイプ失敗でもstatsデータは返す
+      return new Response(
+        JSON.stringify({ success: true, data, source: 'stats.json' }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
+      );
     }
 
-    const html = await response.text();
-    const data = extractData(html);
+    // Strategy 2: HTMLページからの抽出（stats.jsonが使えない場合）
+    const fullData = await fetchFullPage(url);
+    if (fullData) {
+      return new Response(
+        JSON.stringify({ success: true, data: fullData, source: 'html' }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 200 }
+      );
+    }
 
-    console.log('Successfully scraped data:', {
-      title: data.title,
-      targetAmount: data.targetAmount,
-      currentAmount: data.currentAmount,
-      backersCount: data.backersCount,
-      category: data.category,
-    });
-
-    return new Response(
-      JSON.stringify({ success: true, data }),
-      {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        status: 200,
-      }
-    );
+    throw new Error('All scraping strategies failed');
   } catch (error) {
     console.error('Scraping error:', error);
     return new Response(
@@ -87,122 +125,104 @@ Deno.serve(async (req) => {
         error: error.message,
         details: 'Failed to scrape Kickstarter data. Please check the URL and try again.',
       }),
-      {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        status: 500,
-      }
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 500 }
     );
   }
 });
 
-function extractData(html: string): KickstarterData {
-  // Strategy 1: Extract from embedded JSON data (most reliable)
-  const jsonData = extractEmbeddedJson(html);
-  if (jsonData) {
-    console.log('Extracted data from embedded JSON');
-    return jsonData;
-  }
+/**
+ * stats.json エンドポイントからデータを取得（Cloudflare回避可能）
+ * URLから /projects/creator/project-name を抽出し、stats.json を付加
+ */
+async function fetchStats(url: string): Promise<StatsData | null> {
+  try {
+    // URLからプロジェクトパスを抽出
+    const match = url.match(/kickstarter\.com\/(projects\/[^/?#]+\/[^/?#]+)/);
+    if (!match) return null;
 
-  // Strategy 2: Extract from meta tags + data attributes
-  console.log('Falling back to meta tags + HTML extraction');
-  return extractFromHtml(html);
+    const statsUrl = `https://www.kickstarter.com/${match[1]}/stats.json`;
+    console.log('Fetching stats.json:', statsUrl);
+
+    const response = await fetch(statsUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      console.log('stats.json returned:', response.status);
+      return null;
+    }
+
+    return await response.json();
+  } catch (e) {
+    console.log('stats.json fetch failed:', e);
+    return null;
+  }
 }
 
 /**
- * KickstarterはページにプロジェクトデータをJSON形式で埋め込んでいる。
- * window.current_project, data-initial, __NEXT_DATA__ などから取得。
+ * HTMLページ全体をフェッチしてデータを抽出（Cloudflareにブロックされる可能性あり）
  */
+async function fetchFullPage(url: string): Promise<KickstarterData | null> {
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+    },
+  });
+
+  if (!response.ok) return null;
+
+  const html = await response.text();
+
+  // Cloudflareチャレンジページの場合はnull
+  if (html.includes('Just a moment') || html.includes('Enable JavaScript and cookies')) {
+    console.log('Cloudflare challenge detected, skipping HTML extraction');
+    return null;
+  }
+
+  return extractData(html);
+}
+
+function extractData(html: string): KickstarterData {
+  const jsonData = extractEmbeddedJson(html);
+  if (jsonData) return jsonData;
+  return extractFromHtml(html);
+}
+
 function extractEmbeddedJson(html: string): KickstarterData | null {
-  // Pattern 1: window.current_project = {...}
   const currentProjectMatch = html.match(/window\.current_project\s*=\s*"([^"]+)"/);
   if (currentProjectMatch) {
     try {
       const decoded = currentProjectMatch[1]
-        .replace(/\\&quot;/g, '"')
-        .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>');
-      const project = JSON.parse(decoded);
-      return mapProjectJson(project);
-    } catch (e) {
-      console.log('Failed to parse window.current_project:', e);
-    }
+        .replace(/\\&quot;/g, '"').replace(/&quot;/g, '"')
+        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+      return mapProjectJson(JSON.parse(decoded));
+    } catch (e) { console.log('Failed to parse window.current_project:', e); }
   }
 
-  // Pattern 2: data-initial attribute containing project JSON
   const dataInitialMatch = html.match(/data-initial="([^"]+)"/);
   if (dataInitialMatch) {
     try {
       const decoded = dataInitialMatch[1]
-        .replace(/&quot;/g, '"')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>');
+        .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
       const data = JSON.parse(decoded);
       const project = data.project || data;
-      if (project.goal || project.pledged) {
-        return mapProjectJson(project);
-      }
-    } catch (e) {
-      console.log('Failed to parse data-initial:', e);
-    }
-  }
-
-  // Pattern 3: React/Next.js style embedded JSON
-  const scriptMatches = html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi);
-  for (const match of scriptMatches) {
-    const content = match[1];
-
-    // Look for project data object with goal/pledged/backers_count
-    if (content.includes('pledged') && content.includes('goal') && content.includes('backers_count')) {
-      // Try to find a JSON object containing project data
-      const jsonPatterns = [
-        /\{[^{}]*"goal"\s*:\s*\d[\s\S]*?"pledged"\s*:\s*\d[\s\S]*?"backers_count"\s*:\s*\d[^{}]*\}/,
-        /\{[\s\S]*?"project"\s*:\s*\{[\s\S]*?"goal"\s*:[\s\S]*?\}\}/,
-      ];
-
-      for (const pattern of jsonPatterns) {
-        const jsonMatch = content.match(pattern);
-        if (jsonMatch) {
-          try {
-            const parsed = JSON.parse(jsonMatch[0]);
-            const project = parsed.project || parsed;
-            if (project.goal && project.pledged !== undefined) {
-              return mapProjectJson(project);
-            }
-          } catch {
-            // Continue to next pattern
-          }
-        }
-      }
-    }
-  }
-
-  // Pattern 4: Look for JSON-LD with funding data
-  const jsonLdMatches = html.matchAll(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi);
-  for (const match of jsonLdMatches) {
-    try {
-      const ld = JSON.parse(match[1]);
-      if (ld['@type'] === 'CreativeWork' || ld['@type'] === 'Product' || ld.name) {
-        // JSON-LD doesn't usually have funding data, but might have basic info
-        // We'll use it as supplementary data later if needed
-      }
-    } catch {
-      // Skip invalid JSON-LD
-    }
+      if (project.goal || project.pledged) return mapProjectJson(project);
+    } catch (e) { console.log('Failed to parse data-initial:', e); }
   }
 
   return null;
 }
 
-/**
- * KickstarterのプロジェクトJSONをKickstarterDataにマッピング
- */
 function mapProjectJson(project: any): KickstarterData {
   const goal = typeof project.goal === 'object' ? project.goal.amount : project.goal;
   const pledged = typeof project.pledged === 'object' ? project.pledged.amount : project.pledged;
-
   return {
     title: project.name || project.title || '',
     subtitle: project.blurb || project.subtitle || '',
@@ -220,7 +240,6 @@ function mapProjectJson(project: any): KickstarterData {
 
 function mapRewards(rewards: any[] | undefined): KickstarterReward[] | undefined {
   if (!rewards || !Array.isArray(rewards) || rewards.length === 0) return undefined;
-
   return rewards
     .filter((r: any) => r.minimum || r.pledge_amount)
     .map((r: any) => ({
@@ -233,113 +252,43 @@ function mapRewards(rewards: any[] | undefined): KickstarterReward[] | undefined
     }));
 }
 
-/**
- * HTMLメタタグ・data属性からの抽出（フォールバック）
- */
 function extractFromHtml(html: string): KickstarterData {
-  const cleanText = (text: string): string => {
-    if (!text) return '';
-    return text
-      .replace(/<[^>]*>/g, '')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&#39;/g, "'")
-      .replace(/\s+/g, ' ')
-      .trim();
-  };
-
+  const cleanText = (text: string): string =>
+    text ? text.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'").replace(/\s+/g, ' ').trim() : '';
   const parseCurrency = (text: string): number => {
     if (!text) return 0;
     const match = text.replace(/,/g, '').match(/([\d.]+)/);
     return match ? parseFloat(match[1]) : 0;
   };
 
-  // Title
   let title = '';
-  const titlePatterns = [
-    /<meta[^>]*property="og:title"[^>]*content="([^"]+)"/i,
-    /<title[^>]*>([^<]+)<\/title>/i,
-  ];
-  for (const p of titlePatterns) {
+  for (const p of [/<meta[^>]*property="og:title"[^>]*content="([^"]+)"/i, /<title[^>]*>([^<]+)<\/title>/i]) {
     const m = html.match(p);
-    if (m) {
-      title = cleanText(m[1]).replace(/\s*[—–-]\s*Kickstarter$/, '');
-      break;
-    }
+    if (m) { title = cleanText(m[1]).replace(/\s*[—–-]\s*Kickstarter$/, ''); break; }
   }
 
-  // Subtitle
   let subtitle = '';
-  const subtitlePatterns = [
-    /<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i,
-    /<meta[^>]*name="description"[^>]*content="([^"]+)"/i,
-  ];
-  for (const p of subtitlePatterns) {
+  for (const p of [/<meta[^>]*property="og:description"[^>]*content="([^"]+)"/i, /<meta[^>]*name="description"[^>]*content="([^"]+)"/i]) {
     const m = html.match(p);
     if (m) { subtitle = cleanText(m[1]); break; }
   }
 
-  // Image
-  let imageUrl = '';
   const imgMatch = html.match(/<meta[^>]*property="og:image"[^>]*content="([^"]+)"/i);
-  if (imgMatch) imageUrl = imgMatch[1];
+  const imageUrl = imgMatch ? imgMatch[1] : '';
 
-  // Funding data from data attributes
-  let targetAmount = 0;
-  let currentAmount = 0;
-  let backersCount = 0;
-
+  let targetAmount = 0, currentAmount = 0, backersCount = 0;
   const goalMatch = html.match(/data-goal="([^"]+)"/i);
   if (goalMatch) targetAmount = parseCurrency(goalMatch[1]);
-
   const pledgedMatch = html.match(/data-pledged="([^"]+)"/i);
   if (pledgedMatch) currentAmount = parseCurrency(pledgedMatch[1]);
-
   const backersMatch = html.match(/data-backers-count="([^"]+)"/i);
   if (backersMatch) backersCount = parseInt(backersMatch[1]) || 0;
 
-  // Funding data from specific HTML structure (more targeted than before)
-  if (targetAmount === 0) {
-    // Look for goal in specific context: "pledged of $X goal"
-    const goalCtxMatch = html.match(/pledged\s+of\s+[\$¥€£]?([\d,]+(?:\.\d+)?)\s*(?:goal|目標)/i);
-    if (goalCtxMatch) targetAmount = parseCurrency(goalCtxMatch[1]);
-  }
-
-  if (currentAmount === 0) {
-    // Look for pledged amount: "$X pledged"
-    const pledgedCtxMatch = html.match(/[\$¥€£]([\d,]+(?:\.\d+)?)\s*(?:pledged|調達済)/i);
-    if (pledgedCtxMatch) currentAmount = parseCurrency(pledgedCtxMatch[1]);
-  }
-
-  if (backersCount === 0) {
-    // Look for backers count: "X backers" in specific context
-    const backersCtxMatch = html.match(/([\d,]+)\s*(?:backers|supporters|バッカー)/i);
-    if (backersCtxMatch) backersCount = parseInt(backersCtxMatch[1].replace(/,/g, '')) || 0;
-  }
-
-  // Video
-  let videoUrl = '';
-  const videoMatch = html.match(/<meta[^>]*property="og:video"[^>]*content="([^"]+)"/i);
-  if (videoMatch) videoUrl = videoMatch[1];
-
-  // Category
-  let category = '';
-  const catMatch = html.match(/<a[^>]*href="\/discover\/categories\/([^"/?]+)/i);
-  if (catMatch) category = catMatch[1].replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-
   return {
-    title: title || 'Untitled Project',
-    subtitle,
-    imageUrl,
-    targetAmount,
-    currentAmount,
-    backersCount,
-    category: category || '',
-    description: '',
-    creatorDescription: '',
-    videoUrl: videoUrl || undefined,
+    title: title || 'Untitled Project', subtitle, imageUrl,
+    targetAmount, currentAmount, backersCount,
+    category: '', description: '', creatorDescription: '',
   };
 }

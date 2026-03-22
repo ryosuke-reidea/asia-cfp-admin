@@ -18,7 +18,7 @@ export async function updateKickstarterStats(
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
       },
-      body: JSON.stringify({ url: kickstarterUrl }),
+      body: JSON.stringify({ url: kickstarterUrl, mode: 'stats' }),
     });
 
     if (!response.ok) {
@@ -61,12 +61,16 @@ export async function updateProjectWithKickstarterStats(
       : 0;
 
     const updateData: any = {
-      target_amount: stats.targetAmount,
       external_amount_achieved: stats.currentAmount,
       external_buyers_count: stats.backersCount,
       external_achievement_rate: achievementRate,
       updated_at: new Date().toISOString(),
     };
+
+    // targetAmountが取得できた場合のみ更新（stats.jsonでは取得不可）
+    if (stats.targetAmount > 0) {
+      updateData.target_amount = stats.targetAmount;
+    }
 
     // 日付データがある場合は更新
     if (stats.startDate) {
