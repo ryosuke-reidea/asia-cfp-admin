@@ -1,6 +1,9 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import chromium from '@sparticuz/chromium';
-import puppeteer from 'puppeteer-core';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+
+puppeteerExtra.use(StealthPlugin());
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -18,15 +21,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let browser = null;
 
   try {
-    // Cloudflare Bot検出を回避するための設定
-    chromium.setGraphicsMode = false;
-
-    browser = await puppeteer.launch({
+    browser = await puppeteerExtra.launch({
       args: [
         ...chromium.args,
         '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
       ],
       defaultViewport: { width: 1280, height: 720 },
       executablePath: await chromium.executablePath(),
@@ -35,52 +33,60 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const page = await browser.newPage();
 
-    // Bot検出回避: webdriver プロパティを隠す
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      // Chrome runtimeを偽装
-      (window as any).chrome = { runtime: {} };
-      // permissionsを偽装
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters: any) =>
-        parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
-          : originalQuery(parameters);
-      // pluginsを偽装
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => [1, 2, 3, 4, 5],
-      });
-      // languagesを偽装
-      Object.defineProperty(navigator, 'languages', {
-        get: () => ['en-US', 'en'],
-      });
-    });
-
     await page.setUserAgent(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     );
 
-    // Cloudflareチャレンジを突破するため長めに待つ
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 45000 });
+    // ナビゲーション
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    // Cloudflareチャレンジページが表示されている場合、追加で待機
-    const pageTitle = await page.title();
-    if (pageTitle.includes('Just a moment') || pageTitle.includes('Checking')) {
-      console.log('Cloudflare challenge detected, waiting...');
-      await page.waitForFunction(
-        () => !document.title.includes('Just a moment') && !document.title.includes('Checking'),
-        { timeout: 20000 }
-      );
-      // チャレンジ通過後、ページが完全に読み込まれるのを待つ
-      await page.waitForNetworkIdle({ timeout: 10000 });
+    // Cloudflareチャレンジ検出 & 待機
+    const isChallenge = await page.evaluate(() =>
+      document.title.includes('Just a moment') || document.title.includes('Checking')
+    );
+
+    if (isChallenge) {
+      console.log('Cloudflare challenge detected, waiting for resolution...');
+      try {
+        await page.waitForFunction(
+          () => !document.title.includes('Just a moment') && !document.title.includes('Checking'),
+          { timeout: 25000 }
+        );
+        // チャレンジ通過後、コンテンツ読み込み待ち
+        await new Promise(r => setTimeout(r, 3000));
+      } catch {
+        console.log('Cloudflare challenge timeout - proceeding with current page');
+      }
     }
 
-    // ページからプロジェクトデータを抽出
+    // networkIdleを待つ
+    try {
+      await page.waitForNetworkIdle({ timeout: 10000 });
+    } catch {
+      // タイムアウトしても続行
+    }
+
+    // デバッグ: ページタイトルとURLを記録
+    const finalTitle = await page.title();
+    const finalUrl = page.url();
+    console.log('Final page:', { title: finalTitle, url: finalUrl });
+
+    // データ抽出
     const data = await page.evaluate(() => {
       const parseNum = (text: string | null | undefined): number => {
         if (!text) return 0;
         return parseFloat(text.replace(/[^0-9.]/g, '')) || 0;
       };
+
+      // ページがまだCloudflareチャレンジの場合
+      if (document.title.includes('Just a moment') || document.title.includes('Checking')) {
+        return {
+          title: '', subtitle: '', imageUrl: '',
+          targetAmount: 0, currentAmount: 0, backersCount: 0,
+          category: '', source: 'cloudflare-blocked',
+          debug: 'Cloudflare challenge was not resolved',
+        };
+      }
 
       // Strategy 1: window.current_project
       const cp = (window as any).current_project;
@@ -88,8 +94,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const goal = typeof cp.goal === 'object' ? cp.goal.amount : cp.goal;
         const pledged = typeof cp.pledged === 'object' ? cp.pledged.amount : cp.pledged;
         return {
-          title: cp.name || '',
-          subtitle: cp.blurb || '',
+          title: cp.name || '', subtitle: cp.blurb || '',
           imageUrl: cp.photo?.full || cp.photo?.med || '',
           targetAmount: parseFloat(goal) || 0,
           currentAmount: parseFloat(pledged) || 0,
@@ -99,18 +104,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         };
       }
 
-      // Strategy 2: data-initial属性
-      const dataInitialEl = document.querySelector('[data-initial]');
-      if (dataInitialEl) {
+      // Strategy 2: data-initial
+      const diEl = document.querySelector('[data-initial]');
+      if (diEl) {
         try {
-          const d = JSON.parse(dataInitialEl.getAttribute('data-initial') || '{}');
+          const d = JSON.parse(diEl.getAttribute('data-initial') || '{}');
           const p = d.project;
           if (p && (p.goal || p.pledged)) {
             const goal = typeof p.goal === 'object' ? p.goal.amount : p.goal;
             const pledged = typeof p.pledged === 'object' ? p.pledged.amount : p.pledged;
             return {
-              title: p.name || '',
-              subtitle: p.blurb || '',
+              title: p.name || '', subtitle: p.blurb || '',
               imageUrl: p.photo?.full || p.photo?.med || '',
               targetAmount: parseFloat(goal) || 0,
               currentAmount: parseFloat(pledged) || 0,
@@ -122,36 +126,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         } catch {}
       }
 
-      // Strategy 3: ページ上のReactコンポーネントのpropsからデータを取得
+      // Strategy 3: scriptタグからJSON抽出
       const scripts = document.querySelectorAll('script');
       for (const script of scripts) {
         const text = script.textContent || '';
-        if (text.includes('"pledged"') && text.includes('"goal"') && text.includes('"backers_count"')) {
-          try {
-            // pledged/goal/backers_countを含むJSONオブジェクトを抽出
-            const match = text.match(/"goal"\s*:\s*([\d.]+).*?"pledged"\s*:\s*([\d.]+).*?"backers_count"\s*:\s*(\d+)/s);
-            if (match) {
-              return {
-                title: document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.replace(/\s*[—–-]\s*Kickstarter$/, '') || '',
-                subtitle: document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
-                imageUrl: document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
-                targetAmount: parseFloat(match[1]) || 0,
-                currentAmount: parseFloat(match[2]) || 0,
-                backersCount: parseInt(match[3]) || 0,
-                category: '',
-                source: 'script-regex',
-              };
-            }
-          } catch {}
+        if (text.includes('"pledged"') && text.includes('"goal"')) {
+          const goalMatch = text.match(/"goal"\s*:\s*([\d.]+)/);
+          const pledgedMatch = text.match(/"pledged"\s*:\s*([\d.]+)/);
+          const backersMatch = text.match(/"backers_count"\s*:\s*(\d+)/);
+          if (goalMatch && pledgedMatch) {
+            return {
+              title: document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.replace(/\s*[—–-]\s*Kickstarter$/, '') || '',
+              subtitle: document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
+              imageUrl: document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
+              targetAmount: parseFloat(goalMatch[1]) || 0,
+              currentAmount: parseFloat(pledgedMatch[1]) || 0,
+              backersCount: backersMatch ? parseInt(backersMatch[1]) : 0,
+              category: '', source: 'script-regex',
+            };
+          }
         }
       }
 
-      // Strategy 4: DOM要素から直接取得
-      let targetAmount = 0;
-      let currentAmount = 0;
-      let backersCount = 0;
+      // Strategy 4: DOM テキスト抽出
+      let targetAmount = 0, currentAmount = 0, backersCount = 0;
 
-      // data属性
       const goalEl = document.querySelector('[data-goal]');
       if (goalEl) targetAmount = parseNum(goalEl.getAttribute('data-goal'));
       const pledgedEl = document.querySelector('[data-pledged]');
@@ -159,10 +158,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const backersEl = document.querySelector('[data-backers-count]');
       if (backersEl) backersCount = parseInt(backersEl.getAttribute('data-backers-count') || '0');
 
-      // テキストからの抽出
       if (currentAmount === 0 || targetAmount === 0 || backersCount === 0) {
         const bodyText = document.body.innerText;
-
         if (currentAmount === 0) {
           const m = bodyText.match(/[\$€£¥]\s*([\d,]+(?:\.\d+)?)\s*\n?\s*pledged/i);
           if (m) currentAmount = parseNum(m[1]);
@@ -177,20 +174,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       }
 
+      // デバッグ: bodyの最初の500文字を返す
+      const bodyPreview = document.body.innerText.substring(0, 500);
+
       return {
         title: document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.replace(/\s*[—–-]\s*Kickstarter$/, '') || '',
         subtitle: document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
         imageUrl: document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
-        targetAmount,
-        currentAmount,
-        backersCount,
-        category: '',
-        source: 'dom-fallback',
+        targetAmount, currentAmount, backersCount,
+        category: '', source: 'dom-fallback',
+        debug: bodyPreview,
       };
     });
 
-    // デバッグ情報
-    console.log('Scraped data:', JSON.stringify(data));
+    console.log('Scraped result:', JSON.stringify(data));
+
+    // Cloudflareにブロックされた場合はエラーとして返す
+    if (data.source === 'cloudflare-blocked') {
+      return res.status(503).json({
+        success: false,
+        error: 'Cloudflare protection could not be bypassed',
+        data,
+      });
+    }
 
     return res.status(200).json({ success: true, data });
   } catch (error: any) {
