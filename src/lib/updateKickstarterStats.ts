@@ -11,12 +11,11 @@ export async function updateKickstarterStats(
   kickstarterUrl: string
 ): Promise<{ success: boolean; data?: KickstarterStats; error?: string }> {
   try {
-    // Supabase Edge Function (scrape-kickstarter) を使用してKickstarterの最新データを取得
-    const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/scrape-kickstarter`, {
+    // Vercel Serverless Function (Puppeteer) を使用してKickstarterの最新データを取得
+    const response = await fetch('/api/scrape-kickstarter', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
       },
       body: JSON.stringify({ url: kickstarterUrl }),
     });
