@@ -3,21 +3,14 @@ import chromium from '@sparticuz/chromium';
 import puppeteer from 'puppeteer-core';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { url } = req.body;
-
   if (!url || !url.includes('kickstarter.com/projects/')) {
     return res.status(400).json({ error: 'Valid Kickstarter project URL is required' });
   }
@@ -25,8 +18,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let browser = null;
 
   try {
+    // Cloudflare Bot検出を回避するための設定
+    chromium.setGraphicsMode = false;
+
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: [
+        ...chromium.args,
+        '--disable-blink-features=AutomationControlled',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+      ],
       defaultViewport: { width: 1280, height: 720 },
       executablePath: await chromium.executablePath(),
       headless: true,
@@ -34,41 +35,66 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const page = await browser.newPage();
 
+    // Bot検出回避: webdriver プロパティを隠す
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      // Chrome runtimeを偽装
+      (window as any).chrome = { runtime: {} };
+      // permissionsを偽装
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters: any) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
+          : originalQuery(parameters);
+      // pluginsを偽装
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5],
+      });
+      // languagesを偽装
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+      });
+    });
+
     await page.setUserAgent(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     );
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    // Cloudflareチャレンジを突破するため長めに待つ
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 45000 });
+
+    // Cloudflareチャレンジページが表示されている場合、追加で待機
+    const pageTitle = await page.title();
+    if (pageTitle.includes('Just a moment') || pageTitle.includes('Checking')) {
+      console.log('Cloudflare challenge detected, waiting...');
+      await page.waitForFunction(
+        () => !document.title.includes('Just a moment') && !document.title.includes('Checking'),
+        { timeout: 20000 }
+      );
+      // チャレンジ通過後、ページが完全に読み込まれるのを待つ
+      await page.waitForNetworkIdle({ timeout: 10000 });
+    }
 
     // ページからプロジェクトデータを抽出
     const data = await page.evaluate(() => {
-      // Helper: テキストからクリーンな数値を抽出
-      const parseNumber = (text: string | null | undefined): number => {
+      const parseNum = (text: string | null | undefined): number => {
         if (!text) return 0;
-        const cleaned = text.replace(/[^0-9.]/g, '');
-        return parseFloat(cleaned) || 0;
+        return parseFloat(text.replace(/[^0-9.]/g, '')) || 0;
       };
 
-      // Strategy 1: window.current_project（KSが埋め込むJSON）
-      const currentProject = (window as any).current_project;
-      if (currentProject) {
-        const goal = typeof currentProject.goal === 'object'
-          ? currentProject.goal.amount
-          : currentProject.goal;
-        const pledged = typeof currentProject.pledged === 'object'
-          ? currentProject.pledged.amount
-          : currentProject.pledged;
-
+      // Strategy 1: window.current_project
+      const cp = (window as any).current_project;
+      if (cp) {
+        const goal = typeof cp.goal === 'object' ? cp.goal.amount : cp.goal;
+        const pledged = typeof cp.pledged === 'object' ? cp.pledged.amount : cp.pledged;
         return {
-          title: currentProject.name || '',
-          subtitle: currentProject.blurb || '',
-          imageUrl: currentProject.photo?.full || currentProject.photo?.med || '',
+          title: cp.name || '',
+          subtitle: cp.blurb || '',
+          imageUrl: cp.photo?.full || cp.photo?.med || '',
           targetAmount: parseFloat(goal) || 0,
           currentAmount: parseFloat(pledged) || 0,
-          backersCount: parseInt(currentProject.backers_count) || 0,
-          category: currentProject.category?.name || '',
-          description: currentProject.description || '',
-          creatorDescription: currentProject.creator?.blurb || '',
+          backersCount: parseInt(cp.backers_count) || 0,
+          category: cp.category?.name || '',
           source: 'window.current_project',
         };
       }
@@ -77,80 +103,94 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const dataInitialEl = document.querySelector('[data-initial]');
       if (dataInitialEl) {
         try {
-          const initialData = JSON.parse(dataInitialEl.getAttribute('data-initial') || '{}');
-          const project = initialData.project;
-          if (project && (project.goal || project.pledged)) {
-            const goal = typeof project.goal === 'object' ? project.goal.amount : project.goal;
-            const pledged = typeof project.pledged === 'object' ? project.pledged.amount : project.pledged;
-
+          const d = JSON.parse(dataInitialEl.getAttribute('data-initial') || '{}');
+          const p = d.project;
+          if (p && (p.goal || p.pledged)) {
+            const goal = typeof p.goal === 'object' ? p.goal.amount : p.goal;
+            const pledged = typeof p.pledged === 'object' ? p.pledged.amount : p.pledged;
             return {
-              title: project.name || '',
-              subtitle: project.blurb || '',
-              imageUrl: project.photo?.full || project.photo?.med || '',
+              title: p.name || '',
+              subtitle: p.blurb || '',
+              imageUrl: p.photo?.full || p.photo?.med || '',
               targetAmount: parseFloat(goal) || 0,
               currentAmount: parseFloat(pledged) || 0,
-              backersCount: parseInt(project.backers_count) || 0,
-              category: project.category?.name || '',
-              description: project.description || '',
-              creatorDescription: project.creator?.blurb || '',
+              backersCount: parseInt(p.backers_count) || 0,
+              category: p.category?.name || '',
               source: 'data-initial',
             };
           }
         } catch {}
       }
 
-      // Strategy 3: DOM要素から直接取得
-      const title = document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.replace(/\s*[—–-]\s*Kickstarter$/, '') || '';
-      const subtitle = document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '';
-      const imageUrl = document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
+      // Strategy 3: ページ上のReactコンポーネントのpropsからデータを取得
+      const scripts = document.querySelectorAll('script');
+      for (const script of scripts) {
+        const text = script.textContent || '';
+        if (text.includes('"pledged"') && text.includes('"goal"') && text.includes('"backers_count"')) {
+          try {
+            // pledged/goal/backers_countを含むJSONオブジェクトを抽出
+            const match = text.match(/"goal"\s*:\s*([\d.]+).*?"pledged"\s*:\s*([\d.]+).*?"backers_count"\s*:\s*(\d+)/s);
+            if (match) {
+              return {
+                title: document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.replace(/\s*[—–-]\s*Kickstarter$/, '') || '',
+                subtitle: document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
+                imageUrl: document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
+                targetAmount: parseFloat(match[1]) || 0,
+                currentAmount: parseFloat(match[2]) || 0,
+                backersCount: parseInt(match[3]) || 0,
+                category: '',
+                source: 'script-regex',
+              };
+            }
+          } catch {}
+        }
+      }
 
-      // data属性から取得
+      // Strategy 4: DOM要素から直接取得
       let targetAmount = 0;
       let currentAmount = 0;
       let backersCount = 0;
 
+      // data属性
       const goalEl = document.querySelector('[data-goal]');
-      if (goalEl) targetAmount = parseNumber(goalEl.getAttribute('data-goal'));
-
+      if (goalEl) targetAmount = parseNum(goalEl.getAttribute('data-goal'));
       const pledgedEl = document.querySelector('[data-pledged]');
-      if (pledgedEl) currentAmount = parseNumber(pledgedEl.getAttribute('data-pledged'));
-
+      if (pledgedEl) currentAmount = parseNum(pledgedEl.getAttribute('data-pledged'));
       const backersEl = document.querySelector('[data-backers-count]');
       if (backersEl) backersCount = parseInt(backersEl.getAttribute('data-backers-count') || '0');
 
-      // DOM内のテキストからフォールバック取得
-      if (currentAmount === 0) {
-        // "pledged of" の前にある金額を探す
-        const allText = document.body.innerText;
-        const pledgedMatch = allText.match(/[\$€£¥][\s]*([\d,]+(?:\.\d+)?)\s*(?:\n|\r|\s)*pledged/i);
-        if (pledgedMatch) currentAmount = parseNumber(pledgedMatch[1]);
-      }
+      // テキストからの抽出
+      if (currentAmount === 0 || targetAmount === 0 || backersCount === 0) {
+        const bodyText = document.body.innerText;
 
-      if (targetAmount === 0) {
-        const allText = document.body.innerText;
-        const goalMatch = allText.match(/pledged of\s*[\$€£¥][\s]*([\d,]+(?:\.\d+)?)\s*goal/i);
-        if (goalMatch) targetAmount = parseNumber(goalMatch[1]);
-      }
-
-      if (backersCount === 0) {
-        const allText = document.body.innerText;
-        const backersMatch = allText.match(/([\d,]+)\s*backers?/i);
-        if (backersMatch) backersCount = parseInt(backersMatch[1].replace(/,/g, ''));
+        if (currentAmount === 0) {
+          const m = bodyText.match(/[\$€£¥]\s*([\d,]+(?:\.\d+)?)\s*\n?\s*pledged/i);
+          if (m) currentAmount = parseNum(m[1]);
+        }
+        if (targetAmount === 0) {
+          const m = bodyText.match(/pledged of\s*[\$€£¥]\s*([\d,]+(?:\.\d+)?)\s*goal/i);
+          if (m) targetAmount = parseNum(m[1]);
+        }
+        if (backersCount === 0) {
+          const m = bodyText.match(/([\d,]+)\s*\n?\s*backers?/i);
+          if (m) backersCount = parseInt(m[1].replace(/,/g, ''));
+        }
       }
 
       return {
-        title,
-        subtitle,
-        imageUrl,
+        title: document.querySelector('meta[property="og:title"]')?.getAttribute('content')?.replace(/\s*[—–-]\s*Kickstarter$/, '') || '',
+        subtitle: document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '',
+        imageUrl: document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '',
         targetAmount,
         currentAmount,
         backersCount,
         category: '',
-        description: '',
-        creatorDescription: '',
         source: 'dom-fallback',
       };
     });
+
+    // デバッグ情報
+    console.log('Scraped data:', JSON.stringify(data));
 
     return res.status(200).json({ success: true, data });
   } catch (error: any) {
@@ -160,8 +200,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       error: error.message || 'Failed to scrape Kickstarter data',
     });
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    if (browser) await browser.close();
   }
 }
